@@ -21,7 +21,14 @@ macOS環境でEarthsoft DVファイルをどうにか扱えるようにするこ
 | `h265sw` | H.265/HEVC | .mp4 | libx265ソフトウェアエンコード (CRF 20, preset slow) |
 | `yuv` | Raw YUV 4:2:2p | .yuv | 無圧縮プレーナー |
 
-ProResはどれもソフトウェアエンコードです。音声はwave形式のまま映像にmuxされます。
+ProResはどれもソフトウェアエンコードです。
+
+### 音声コーデック
+
+| 音声コーデック | 指定値 | 備考 |
+|--------------|--------|------|
+| PCM無圧縮(デフォルト) | `wave` | WAV形式のまま映像にmux |
+| Apple Lossless | `alac` | ロスレス圧縮、PCMの約1/3のサイズ |
 
 ## 必要環境
 
@@ -84,6 +91,9 @@ esdv convert -f h264sw capture.dv output.mp4
 # H.265 (libx265 SW)
 esdv convert -f h265sw capture.dv output.mp4
 
+# 音声をALAC (Apple Lossless) にエンコード
+esdv convert -a alac capture.dv
+
 # フレームレートを指定 (デフォルト: 29.97)
 esdv convert -f prores -r 29.97 capture.dv output.mov
 
@@ -145,7 +155,7 @@ esdv capture.dv
   ├─ FFmpegPipe        rawvideo (yuv422p) を stdin パイプで ffmpeg に供給
   │    └─ 映像エンコード: ProRes / H.264 / H.265 (HW/SW)
   ├─ 音声 WAV          PCM バイトスワップ (BE→LE) → WAV 一時ファイル
-  └─ mux               映像+音声を ffmpeg で合成 → 最終出力
+  └─ mux               映像+音声を ffmpeg で合成 → 最終出力 (音声: PCM/ALAC)
 ```
 
 ### ファイル構成
@@ -166,6 +176,7 @@ Sources/esdv/
 - コーデックバージョン2のみ対応
 - フレームレートは手動指定(デフォルト29.97fps)。プログレッシブ素材では`-r 59.94`の指定が必要な場合がありますが、十分なテストを行えていません
 - ProResはどれもprores_ksによるソフトウェアエンコードです。ハードウェアエンコード（VideoToolbox）はprores_ksに比べて十分なパフォーマンスを出せなかったため
+- ソースファイルのビットストリームにエラー（不正なrun length等）が含まれる場合、該当フレームの映像にノイズが生じます。DV VLCにはリージョン内の再同期マーカーがないため、デコーダー側での回復はできません。リファレンス実装（smdn.jp libavパッチ）でも同様の結果になります。変換時にエラーが検出された場合は該当フレーム番号を警告出力します
 
 ## 参考資料
 
