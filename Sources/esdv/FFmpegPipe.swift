@@ -6,16 +6,24 @@ import Foundation
 // MARK: - 出力フォーマット
 
 enum OutputFormat: String, CaseIterable {
-    case prores    = "prores"
-    case h264      = "h264"
-    case h265      = "h265"
-    case h264sw    = "h264sw"
-    case h265sw    = "h265sw"
-    case rawYUV    = "yuv"
+    case prores       = "prores"
+    case prores422HQ  = "prores_422hq"
+    case proresProxy  = "prores_proxy"
+    case proresLT     = "prores_lt"
+    case prores422    = "prores_422"
+    case prores4444   = "prores_4444"
+    case prores4444XQ = "prores_4444xq"
+    case h264         = "h264"
+    case h265         = "h265"
+    case h264sw       = "h264sw"
+    case h265sw       = "h265sw"
+    case rawYUV       = "yuv"
 
     var fileExtension: String {
         switch self {
-        case .prores:            return "mov"
+        case .prores, .prores422HQ, .proresProxy, .proresLT, .prores422,
+             .prores4444, .prores4444XQ:
+            return "mov"
         case .h264, .h264sw:     return "mp4"
         case .h265, .h265sw:     return "mp4"
         case .rawYUV:            return "yuv"
@@ -24,12 +32,52 @@ enum OutputFormat: String, CaseIterable {
 
     var description: String {
         switch self {
-        case .prores:  return "Apple ProRes 422 HQ"
+        case .prores:       return "Apple ProRes 422 HQ"
+        case .prores422HQ:  return "Apple ProRes 422 HQ"
+        case .proresProxy:  return "Apple ProRes 422 Proxy"
+        case .proresLT:     return "Apple ProRes 422 LT"
+        case .prores422:    return "Apple ProRes 422"
+        case .prores4444:   return "Apple ProRes 4444"
+        case .prores4444XQ: return "Apple ProRes 4444 XQ"
         case .h264:    return "H.264 (VideoToolbox HW)"
         case .h265:    return "H.265 (VideoToolbox HW)"
         case .h264sw:  return "H.264 (libx264 SW)"
         case .h265sw:  return "H.265 (libx265 SW)"
         case .rawYUV:  return "Raw YUV 4:2:2p"
+        }
+    }
+
+    var isProRes: Bool {
+        switch self {
+        case .prores, .prores422HQ, .proresProxy, .proresLT, .prores422,
+             .prores4444, .prores4444XQ:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// prores_ks の -profile:v 値
+    var proresProfile: String {
+        switch self {
+        case .proresProxy:  return "0"
+        case .proresLT:     return "1"
+        case .prores422:    return "2"
+        case .prores:       return "3"
+        case .prores422HQ:  return "3"
+        case .prores4444:   return "4"
+        case .prores4444XQ: return "5"
+        default:            return "3"
+        }
+    }
+
+    /// ProRes 出力ピクセルフォーマット
+    var proresPixelFormat: String {
+        switch self {
+        case .prores4444, .prores4444XQ:
+            return "yuv444p10le"
+        default:
+            return "yuv422p10le"
         }
     }
 }
@@ -89,12 +137,12 @@ final class FFmpegPipe {
         }
 
         switch format {
-        case .prores:
+        case .prores, .prores422HQ, .proresProxy, .proresLT, .prores422, .prores4444, .prores4444XQ:
             args += [
                 "-c:v", "prores_ks",
-                "-profile:v", "3",     // ProRes 422 HQ
+                "-profile:v", format.proresProfile,
                 "-vendor", "apl0",
-                "-pix_fmt", "yuv422p10le",
+                "-pix_fmt", format.proresPixelFormat,
             ]
             if isInterlaced {
                 args += ["-flags", "+ildct"]

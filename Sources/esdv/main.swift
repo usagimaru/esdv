@@ -13,6 +13,8 @@ cli.run()
 
 final class ESDVCLI {
 
+    static let version = "1.1.0"
+
     func run() {
         let args = CommandLine.arguments
         if args.count < 2 {
@@ -25,6 +27,8 @@ final class ESDVCLI {
             runConvert(args: Array(args.dropFirst(2)))
         case "info":
             runInfo(args: Array(args.dropFirst(2)))
+        case "version", "--version", "-V":
+            print("esdv \(Self.version)")
         case "help", "--help", "-h":
             printUsage()
         default:
@@ -43,6 +47,7 @@ final class ESDVCLI {
         var outputPath: String?
         var format: OutputFormat = .prores
         var frameRate: Double = 29.97
+        var threads: Int?
         var verbose = false
 
         var i = 0
@@ -59,6 +64,10 @@ final class ESDVCLI {
                 i += 1
                 guard i < args.count, let fps = Double(args[i]) else { die("--fps の後に数値が必要です") }
                 frameRate = fps
+            case "-t", "--threads":
+                i += 1
+                guard i < args.count, let t = Int(args[i]), t >= 0 else { die("--threads の後に0以上の整数が必要です") }
+                if t > 0 { threads = t }
             case "-o", "--output":
                 i += 1
                 guard i < args.count else { die("--output の後にパスが必要です") }
@@ -90,12 +99,16 @@ final class ESDVCLI {
             outURL = inputURL.deletingPathExtension().appendingPathExtension(format.fileExtension)
         }
 
+        let cpuCount = ProcessInfo.processInfo.activeProcessorCount
+        let workerCount = min(threads ?? cpuCount, cpuCount)
+
         do {
             try convertFile(
                 input: inputURL,
                 output: outURL,
                 format: format,
                 frameRate: frameRate,
+                workerCount: workerCount,
                 verbose: verbose
             )
             print("完了: \(outURL.path)")
@@ -105,10 +118,10 @@ final class ESDVCLI {
         }
     }
 
-    // MARK: - ストリーミング変換パイプライン
+    // MARK: - 並列変換パイプライン
     //
-    // 1フレームずつデコード → ffmpeg パイプ書き込みを繰り返す。
-    // 映像メモリ使用量はフレーム1枚分 (~3MB @1080p YUV422) に収まる。
+    // チャンク単位で複数フレームを並列デコード → 順序付き ffmpeg パイプ書き込み。
+    // 映像メモリ使用量はチャンクサイズ分 (~80MB @1080p, コア数×2フレーム)。
     // 音声は WAV ヘッダ先行書き込み → PCM をフレームごとに追記。
 
     private func convertFile(
@@ -116,6 +129,7 @@ final class ESDVCLI {
         output: URL,
         format: OutputFormat,
         frameRate: Double,
+        workerCount: Int,
         verbose: Bool
     ) throws {
         // 1. パース
@@ -136,13 +150,11 @@ final class ESDVCLI {
         print("  音声: \(audioRate) Hz / 2ch / 16bit PCM")
         print("  出力: \(output.lastPathComponent) [\(format.description)]")
 
-        let decoder = ESDVDecoder(fileHeader: header)
-
         // 2. rawYUV は ffmpeg を介さず直接書き出し
         if format == .rawYUV {
             try writeRawYUVStreaming(
-                frames: frames, decoder: decoder,
-                to: output, verbose: verbose
+                frames: frames, fileHeader: header,
+                to: output, workerCount: workerCount, verbose: verbose
             )
             return
         }
@@ -177,20 +189,46 @@ final class ESDVCLI {
             sampleRate: audioRate
         )
 
-        // 6. ストリーミングデコード + パイプ書き込み
-        print("デコード+エンコード中...")
-        for (idx, frame) in frames.enumerated() {
-            let video = try decoder.decodeFrame(frame)
-            try pipe.writeVideoFrame(video)
+        // 6. 並列デコード + 順序付きパイプ書き込み
+        //
+        // チャンク単位で複数フレームを同時デコードし、順序通りに ffmpeg へ書き込む。
+        // 各チャンク内のフレームは独立 (フレーム間予測なし) なので安全に並列化可能。
+        // メモリ使用量: chunkSize × ~4MB/frame (1080p YUV422)
+        let chunkSize = max(1, workerCount * 2)
+        print("デコード+エンコード中... (\(workerCount)スレッド並列)")
 
-            if !frame.audioPCM.isEmpty {
-                // Earthsoft 音声は 16-bit BE PCM → WAV 用に LE に変換
-                audioHandle.write(swapAudioEndian(frame.audioPCM))
+        for chunkStart in stride(from: 0, to: frames.count, by: chunkSize) {
+            let chunkEnd = min(chunkStart + chunkSize, frames.count)
+            let chunkCount = chunkEnd - chunkStart
+
+            var decoded = [DecodedVideoFrame?](repeating: nil, count: chunkCount)
+            decoded.withUnsafeMutableBufferPointer { buf in
+                let base = buf.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: chunkCount) { i in
+                    let d = ESDVDecoder(fileHeader: header)
+                    base[i] = try? d.decodeFrame(frames[chunkStart + i])
+                }
             }
 
-            if verbose || (idx + 1) % 100 == 0 || idx == frames.count - 1 {
-                print("  \(idx + 1) / \(frames.count) フレーム", terminator: "\r")
-                fflush(stdout)
+            for i in 0..<chunkCount {
+                guard let video = decoded[i] else {
+                    // try? が nil → 同じフレームを try で再デコードしてエラーを伝搬
+                    let d = ESDVDecoder(fileHeader: header)
+                    _ = try d.decodeFrame(frames[chunkStart + i])
+                    fatalError("unreachable")
+                }
+                try pipe.writeVideoFrame(video)
+
+                let frame = frames[chunkStart + i]
+                if !frame.audioPCM.isEmpty {
+                    audioHandle.write(swapAudioEndian(frame.audioPCM))
+                }
+
+                let globalIdx = chunkStart + i
+                if verbose || (globalIdx + 1) % 100 == 0 || globalIdx == frames.count - 1 {
+                    print("  \(globalIdx + 1) / \(frames.count) フレーム", terminator: "\r")
+                    fflush(stdout)
+                }
             }
         }
         print("")
@@ -212,8 +250,9 @@ final class ESDVCLI {
 
     private func writeRawYUVStreaming(
         frames: [ESDVFrame],
-        decoder: ESDVDecoder,
+        fileHeader: ESDVFileHeader,
         to url: URL,
+        workerCount: Int,
         verbose: Bool
     ) throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -222,16 +261,37 @@ final class ESDVCLI {
         }
         defer { handle.closeFile() }
 
-        print("デコード+書き出し中...")
-        for (idx, frame) in frames.enumerated() {
-            let video = try decoder.decodeFrame(frame)
-            try handle.write(contentsOf: video.yPlane)
-            try handle.write(contentsOf: video.cbPlane)
-            try handle.write(contentsOf: video.crPlane)
+        let chunkSize = max(1, workerCount * 2)
+        print("デコード+書き出し中... (\(workerCount)スレッド並列)")
 
-            if verbose || (idx + 1) % 100 == 0 || idx == frames.count - 1 {
-                print("  \(idx + 1) / \(frames.count) フレーム", terminator: "\r")
-                fflush(stdout)
+        for chunkStart in stride(from: 0, to: frames.count, by: chunkSize) {
+            let chunkEnd = min(chunkStart + chunkSize, frames.count)
+            let chunkCount = chunkEnd - chunkStart
+
+            var decoded = [DecodedVideoFrame?](repeating: nil, count: chunkCount)
+            decoded.withUnsafeMutableBufferPointer { buf in
+                let base = buf.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: chunkCount) { i in
+                    let d = ESDVDecoder(fileHeader: fileHeader)
+                    base[i] = try? d.decodeFrame(frames[chunkStart + i])
+                }
+            }
+
+            for i in 0..<chunkCount {
+                guard let video = decoded[i] else {
+                    let d = ESDVDecoder(fileHeader: fileHeader)
+                    _ = try d.decodeFrame(frames[chunkStart + i])
+                    fatalError("unreachable")
+                }
+                try handle.write(contentsOf: video.yPlane)
+                try handle.write(contentsOf: video.cbPlane)
+                try handle.write(contentsOf: video.crPlane)
+
+                let globalIdx = chunkStart + i
+                if verbose || (globalIdx + 1) % 100 == 0 || globalIdx == frames.count - 1 {
+                    print("  \(globalIdx + 1) / \(frames.count) フレーム", terminator: "\r")
+                    fflush(stdout)
+                }
             }
         }
         print("")
@@ -283,19 +343,29 @@ final class ESDVCLI {
 
     private func printUsage() {
         print("""
+        esdv \(Self.version) - Earthsoft DV (.dv) 変換ツール
+
         使い方:
           esdv convert [オプション] <入力.dv> [出力ファイル]
           esdv info <入力.dv>
+          esdv version          バージョンを表示 (--version, -V も可)
 
         convert オプション:
           -f, --format <fmt>      出力フォーマット (デフォルト: prores)
-                                  prores  … Apple ProRes 422 HQ (.mov)
-                                  h264    … H.264 VideoToolbox HW (.mp4)
-                                  h265    … H.265 VideoToolbox HW (.mp4)
-                                  h264sw  … H.264 libx264 SW (.mp4)
-                                  h265sw  … H.265 libx265 SW (.mp4)
-                                  yuv     … Raw YUV 4:2:2p (.yuv)
+                                  prores       … Apple ProRes 422 HQ (.mov) [デフォルト]
+                                  prores_422hq … Apple ProRes 422 HQ (.mov)
+                                  prores_proxy … Apple ProRes 422 Proxy (.mov)
+                                  prores_lt    … Apple ProRes 422 LT (.mov)
+                                  prores_422   … Apple ProRes 422 (.mov)
+                                  prores_4444  … Apple ProRes 4444 (.mov)
+                                  prores_4444xq… Apple ProRes 4444 XQ (.mov)
+                                  h264         … H.264 VideoToolbox HW (.mp4)
+                                  h265         … H.265 VideoToolbox HW (.mp4)
+                                  h264sw       … H.264 libx264 SW (.mp4)
+                                  h265sw       … H.265 libx265 SW (.mp4)
+                                  yuv          … Raw YUV 4:2:2p (.yuv)
           -r, --fps <fps>         フレームレート (デフォルト: 29.97)
+          -t, --threads <N>       デコード並列数 (デフォルト/0: CPUコア数、上限もコア数)
           -o, --output <出力>     出力ファイルパス (-o なしで第2引数にも指定可)
           -v, --verbose           詳細ログ
 

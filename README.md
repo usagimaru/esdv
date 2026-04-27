@@ -8,14 +8,20 @@ macOS環境でEarthsoft DVファイルをどうにか扱えるようにするこ
 
 | 出力フォーマット | コーデック | ファイル形式 | 備考 |
 |-----------------|-----------|-------------|------|
-| `prores`(デフォルト) | Apple ProRes 422 HQ | .mov | prores_ks SWマルチスレッド |
+| `prores`(デフォルト) | Apple ProRes 422 HQ | .mov | `prores_422hq`と同じ |
+| `prores_422hq` | Apple ProRes 422 HQ | .mov | ~220Mbps @1080p/29.97、視覚的ロスレス、グレーディング向け |
+| `prores_proxy` | Apple ProRes 422 Proxy | .mov | ~45Mbps @1080p/29.97、オフライン編集用プロキシ |
+| `prores_lt` | Apple ProRes 422 LT | .mov | ~102Mbps @1080p/29.97、軽量編集・容量重視 |
+| `prores_422` | Apple ProRes 422 | .mov | ~147Mbps @1080p/29.97、標準的な編集・納品 |
+| `prores_4444` | Apple ProRes 4444 | .mov | ~330Mbps @1080p/29.97、合成・VFX、4:4:4にアップサンプル |
+| `prores_4444xq` | Apple ProRes 4444 XQ | .mov | ~500Mbps @1080p/29.97、HDR・最高品質、4:4:4にアップサンプル |
 | `h264` | H.264 | .mp4 | VideoToolboxハードウェアエンコード（対応するApple Siliconが必要） |
 | `h265` | H.265/HEVC | .mp4 | VideoToolboxハードウェアエンコード（対応するApple Siliconが必要） |
 | `h264sw` | H.264 | .mp4 | libx264ソフトウェアエンコード (CRF 18, preset slow) |
 | `h265sw` | H.265/HEVC | .mp4 | libx265ソフトウェアエンコード (CRF 20, preset slow) |
 | `yuv` | Raw YUV 4:2:2p | .yuv | 無圧縮プレーナー |
 
-音声はwave形式のまま映像にmuxされます。
+ProResはどれもソフトウェアエンコードです。音声はwave形式のまま映像にmuxされます。
 
 ## 必要環境
 
@@ -129,12 +135,13 @@ esdv capture.dv
 
 ### 変換パイプライン
 
-1フレームずつデコード → ffmpegパイプ書き込みのストリーミング方式。映像メモリ使用量はフレーム1枚分(~3MB @1080p YUV422)に収まります。
+チャンク単位で複数フレームを全CPUコアで並列デコードし、順序通りにffmpegへパイプ書き込みするストリーミング方式。Earthsoft DVコーデックにはフレーム間予測がないため、各フレームは独立してデコード可能です。
 
 ```
 .dv ファイル (mmap)
   ├─ ESDVParser        ファイルヘッダ・フレームヘッダ・領域オフセット解析
   ├─ ESDVDecoder       DV VLC デコード → 逆量子化 → IDCT → YUV 4:2:2p
+  │    └─ 並列デコード: チャンク単位で全コア同時実行 (GCD concurrentPerform)
   ├─ FFmpegPipe        rawvideo (yuv422p) を stdin パイプで ffmpeg に供給
   │    └─ 映像エンコード: ProRes / H.264 / H.265 (HW/SW)
   ├─ 音声 WAV          PCM バイトスワップ (BE→LE) → WAV 一時ファイル
@@ -145,10 +152,10 @@ esdv capture.dv
 
 ```
 Sources/esdv/
-  main.swift          CLI エントリポイント、convert/info サブコマンド、ストリーミングパイプライン
+  main.swift          CLI エントリポイント、convert/info サブコマンド、並列デコードパイプライン
   ESDVParser.swift    ファイル/フレームヘッダ解析、領域データ抽出 (mmap)
   ESDVDecoder.swift   VLC デコード、逆量子化、IDCT (行-列分離法)、YUV422p 出力
-  FFmpegPipe.swift    ffmpeg プロセス管理、映像パイプ、音声 WAV、mux
+  FFmpegPipe.swift    ffmpeg プロセス管理、映像パイプ、音声 WAV、mux、11出力フォーマット対応
 ```
 
 ## 既知の制限と留意事項
@@ -158,6 +165,7 @@ Sources/esdv/
 - インターレース素材はインターレースフラグを維持してエンコードします。デインターレース処理は行いません。編集時にはフィールドオーダー(TFF/BFF)を適切に設定してください
 - コーデックバージョン2のみ対応
 - フレームレートは手動指定(デフォルト29.97fps)。プログレッシブ素材では`-r 59.94`の指定が必要な場合がありますが、十分なテストを行えていません
+- ProResはどれもprores_ksによるソフトウェアエンコードです。ハードウェアエンコード（VideoToolbox）はprores_ksに比べて十分なパフォーマンスを出せなかったため
 
 ## 参考資料
 
